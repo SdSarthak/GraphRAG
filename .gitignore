@@ -1,0 +1,16 @@
+﻿.env
+*.env
+.env.local
+.env.*.local
+apikeys.txt
+*.key
+*.pem
+secrets.json
+config.json
+__pycache__/
+*.pyc
+node_modules/
+venv/
+env/
+.vscode/
+.idea/
