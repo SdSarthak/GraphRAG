@@ -1,16 +1,52 @@
-﻿.env
-*.env
+# --- Secrets ---------------------------------------------------------------
+.env
 .env.local
 .env.*.local
+*.env
+!.env.example
 apikeys.txt
+secrets.json
+credentials.json
+serviceAccount*.json
+config.json
 *.key
 *.pem
-secrets.json
-config.json
+
+# --- Python ----------------------------------------------------------------
 __pycache__/
+*.py[cod]
 *.pyc
-node_modules/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 venv/
 env/
+.venv/
+node_modules/
+
+# --- Models, indexes and data ----------------------------------------------
+storage/
+*.h5
+*.pt
+*.pkl
+*.ckpt
+*.onnx
+*.safetensors
+*.npz
+*.faiss
+*.sqlite3
+*.db
+data/
+corpus/
+
+# --- Editors / OS ----------------------------------------------------------
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
