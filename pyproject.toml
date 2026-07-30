@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphrag"
+version = "0.2.0"
+description = "Graph-based Retrieval Augmented Generation: knowledge-graph retrieval fused with dense and lexical search."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Sarthak Doshi" }]
+keywords = ["rag", "knowledge-graph", "retrieval", "llm", "claude"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "networkx>=3.1",
+    "numpy>=1.24",
+    "anthropic>=0.69.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+graphrag = "graphrag.cli:main"
+
+[tool.setuptools]
+packages = ["graphrag"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:graphrag.*"]
