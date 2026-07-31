@@ -7,10 +7,11 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from .config import GraphRAGConfig
-from .pipeline import GraphRAG
+from .documents import TEXT_SUFFIXES
+from .pipeline import CONFIG_FILE, GraphRAG
 
 DEMO_DOCUMENTS: List[str] = [
     "Machine learning is a subset of artificial intelligence that enables "
@@ -39,8 +40,43 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
-def _config_from_args(args: argparse.Namespace) -> GraphRAGConfig:
+def _configure_output() -> None:
+    """Never let a non-ASCII answer crash the CLI.
+
+    The Windows console defaults to cp1252, so printing a Chinese or accented
+    answer raised UnicodeEncodeError instead of showing the result.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - non-standard stream
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):  # pragma: no cover - already detached
+            pass
+
+
+def _stored_config(storage: Path) -> Dict[str, Any]:
+    """The config an existing index was built with, if there is one."""
+    path = storage / CONFIG_FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} does not contain a config object")
+    # storage_dir is where the index is now, not where it was built.
+    data.pop("storage_dir", None)
+    return data
+
+
+def _config_from_args(
+    args: argparse.Namespace, defaults: Optional[Dict[str, Any]] = None
+) -> GraphRAGConfig:
     return GraphRAGConfig.from_env(
+        defaults=defaults,
         llm_model=getattr(args, "model", None),
         extractor=getattr(args, "extractor", None),
         storage_dir=getattr(args, "storage", None),
@@ -55,20 +91,41 @@ def _load_system(args: argparse.Namespace) -> GraphRAG:
         raise SystemExit(
             f"No index found at {storage}. Run 'python -m graphrag index <path>' first."
         )
-    return GraphRAG.load(storage, config=_config_from_args(args))
+    # Start from the settings the index was built with. Ignoring them meant an
+    # index built with a non-default embedding width or chunk size could not be
+    # queried at all unless the same environment happened to be set again.
+    return GraphRAG.load(storage, config=_config_from_args(args, _stored_config(storage)))
 
 
 def cmd_index(args: argparse.Namespace) -> int:
-    config = _config_from_args(args)
+    source = Path(args.path)
+    if not source.exists():
+        raise FileNotFoundError(f"No such file or directory: {source}")
+
+    storage = Path(getattr(args, "storage", None) or GraphRAGConfig.storage_dir)
+    append = bool(args.append) and storage.exists()
+    config = _config_from_args(args, _stored_config(storage) if append else None)
     storage = Path(config.storage_dir)
     system = (
-        GraphRAG.load(storage, config=config)
-        if args.append and storage.exists()
-        else GraphRAG(config=config)
+        GraphRAG.load(storage, config=config) if append else GraphRAG(config=config)
     )
     added = system.add_path(args.path)
+
+    if added == 0 and not system.chunks:
+        # The overwhelmingly common cause is a corpus of unsupported file
+        # types, and silently writing an empty index hides that completely.
+        print(
+            f"error: no readable text found under {source}. Supported "
+            f"extensions: {', '.join(TEXT_SUFFIXES)}",
+            file=sys.stderr,
+        )
+        return 1
+
     system.save(storage)
-    print(f"Indexed {added} new chunks from {args.path}")
+    if added == 0:
+        print(f"Nothing new in {args.path}; the index at {storage} is unchanged")
+    else:
+        print(f"Indexed {added} new chunks from {args.path}")
     print(json.dumps(system.stats(), indent=2))
     return 0
 
@@ -99,11 +156,16 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_entities(args: argparse.Namespace) -> int:
+    if args.depth < 1:
+        raise ValueError("--depth must be at least 1")
     system = _load_system(args)
     if args.entity:
+        if not system.graph.has_entity(args.entity):
+            print(f"'{args.entity}' is not in the graph.", file=sys.stderr)
+            return 1
         related = system.related_entities(args.entity, depth=args.depth)
         if not related:
-            print(f"'{args.entity}' is not in the graph (or has no neighbours).")
+            print(f"'{args.entity}' has no neighbours within {args.depth} hop(s).")
             return 1
         print(f"Entities within {args.depth} hop(s) of '{args.entity}':")
         for key in related:
@@ -120,11 +182,16 @@ def cmd_entities(args: argparse.Namespace) -> int:
 def cmd_export(args: argparse.Namespace) -> int:
     system = _load_system(args)
     output = Path(args.output)
+    if not len(system.graph):
+        print("error: the graph is empty; nothing to export", file=sys.stderr)
+        return 1
     if output.suffix.lower() == ".graphml":
         system.graph.export_graphml(output)
+        fmt = "GraphML"
     else:
         system.graph.save(output)
-    print(f"Exported graph to {output}")
+        fmt = "JSON"
+    print(f"Exported graph to {output} as {fmt}")
     return 0
 
 
@@ -216,9 +283,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
+    _configure_output()
     try:
         return int(args.func(args))
-    except (FileNotFoundError, ValueError) as exc:
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        # Raised by the Claude backend for API, timeout and network failures.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # Permission denied, disk full, unreadable path: a stack trace here
+        # tells the user nothing they can act on.
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

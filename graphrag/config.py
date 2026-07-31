@@ -105,10 +105,26 @@ class GraphRAGConfig:
 
     # --- Factories ------------------------------------------------------
     @classmethod
-    def from_env(cls, **overrides: Any) -> "GraphRAGConfig":
-        """Build a config from environment variables, then apply overrides."""
+    def from_env(
+        cls, defaults: Optional[Dict[str, Any]] = None, **overrides: Any
+    ) -> "GraphRAGConfig":
+        """Build a config from environment variables, then apply overrides.
+
+        Precedence, lowest first: dataclass defaults, ``defaults`` (typically
+        the config stored alongside an existing index), environment
+        variables, explicit ``overrides``.
+        """
         _load_dotenv()
         values: Dict[str, Any] = {}
+        if defaults:
+            known = {field.name for field in fields(cls)}
+            values.update(
+                {
+                    key: value
+                    for key, value in defaults.items()
+                    if key in known and value is not None
+                }
+            )
         for field in fields(cls):
             variable = ENV_PREFIX + field.name.upper()
             raw = os.environ.get(variable)
@@ -130,7 +146,7 @@ class GraphRAGConfig:
                 values["api_key"] = api_key
 
         values.update({k: v for k, v in overrides.items() if v is not None})
-        return cls(**values)
+        return cls(**cls._coerced(values))
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -142,22 +158,29 @@ class GraphRAGConfig:
         """Rebuild a config from a saved (or hand-edited) ``config.json``."""
         if not isinstance(data, dict):
             raise ValueError("config data must be a JSON object")
+        return cls(**cls._coerced(data))
+
+    @classmethod
+    def _coerced(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep known keys, converting strings to the declared field type.
+
+        A saved or hand-edited config.json can hold "180" where 180 is meant;
+        coercing here keeps validation type-correct instead of blowing up with
+        a TypeError on the first comparison.
+        """
         known = {field.name: field for field in fields(cls)}
         values: Dict[str, Any] = {}
         for key, value in data.items():
             field = known.get(key)
             if field is None:
                 continue
-            # A hand-edited config.json can hold "180" where 180 is meant;
-            # coercing here keeps the validation below type-correct instead of
-            # blowing up with a TypeError on the first comparison.
             if isinstance(value, str) and "str" not in str(field.type):
                 try:
                     value = _coerce(value, field.type)
                 except ValueError as exc:
                     raise ValueError(f"invalid value for {key}: {exc}") from exc
             values[key] = value
-        return cls(**values)
+        return values
 
 
 def _coerce(raw: str, annotation: Any) -> Any:
