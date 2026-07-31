@@ -342,12 +342,19 @@ class HybridRetriever:
     ) -> str:
         """Render retrieved chunks as a numbered, citation-friendly context."""
         max_chars = max_chars or self.config.max_context_chars
+        if max_chars <= 0:
+            raise ValueError("max_chars must be positive")
         parts: List[str] = []
         used = 0
         for index, result in enumerate(results, start=1):
             block = f"[{index}] (source: {result.chunk.source})\n{result.text}"
-            if used + len(block) > max_chars and parts:
-                break
+            if used + len(block) > max_chars:
+                if parts:
+                    break
+                # A single chunk larger than the whole budget used to be
+                # emitted in full, so a big chunk_size silently blew past
+                # max_context_chars and inflated every prompt.
+                block = block[:max_chars]
             parts.append(block)
             used += len(block)
         return "\n\n".join(parts)

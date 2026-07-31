@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,11 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Unio
 from .text import normalize
 
 TEXT_SUFFIXES = (".txt", ".md", ".markdown", ".rst", ".log")
+_SKIP_DIRECTORIES = frozenset(
+    {"__pycache__", "node_modules", "venv", "env", "site-packages"}
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _hash_id(prefix: str, text: str) -> str:
@@ -159,16 +165,33 @@ def coerce_documents(
 def iter_text_files(
     path: Union[str, os.PathLike], suffixes: Sequence[str] = TEXT_SUFFIXES
 ) -> Iterator[Path]:
-    """Yield text files under ``path`` (a file or a directory tree)."""
+    """Yield text files under ``path`` (a file or a directory tree).
+
+    Walks with ``os.walk``: ``Path.rglob`` follows directory symlinks, so a
+    corpus containing a symlink cycle made indexing run forever.
+    """
     root = Path(path)
     if root.is_file():
         yield root
         return
     if not root.exists():
         raise FileNotFoundError(f"No such file or directory: {root}")
-    for candidate in sorted(root.rglob("*")):
-        if candidate.is_file() and candidate.suffix.lower() in suffixes:
-            yield candidate
+    if not root.is_dir():
+        raise NotADirectoryError(f"Not a readable file or directory: {root}")
+
+    wanted = {suffix.lower() for suffix in suffixes}
+    for directory, subdirectories, names in os.walk(root, followlinks=False):
+        # Version control and virtualenv directories are never corpus content
+        # and are usually the bulk of the files under a project root.
+        subdirectories[:] = sorted(
+            name
+            for name in subdirectories
+            if not name.startswith(".") and name not in _SKIP_DIRECTORIES
+        )
+        for name in sorted(names):
+            candidate = Path(directory) / name
+            if candidate.suffix.lower() in wanted:
+                yield candidate
 
 
 def load_documents(
@@ -188,15 +211,26 @@ def load_documents(
     Returns:
         A list of non-empty documents.
     """
+    if max_files is not None and max_files <= 0:
+        raise ValueError("max_files must be positive")
+
     documents: List[Document] = []
+    skipped = 0
     for file_path in iter_text_files(path, suffixes):
         if max_files is not None and len(documents) >= max_files:
+            logger.info("Stopped after %d files (max_files)", max_files)
             break
         try:
             raw = file_path.read_text(encoding=encoding, errors="replace")
-        except OSError:
+        except OSError as exc:
+            # A single unreadable file must not abort the corpus, but
+            # swallowing it without a word made permission problems invisible.
+            skipped += 1
+            logger.warning("Skipping %s: %s", file_path, exc)
             continue
         if not raw.strip():
             continue
         documents.append(Document(text=raw, source=str(file_path)))
+    if skipped:
+        logger.warning("Skipped %d unreadable file(s) under %s", skipped, path)
     return documents

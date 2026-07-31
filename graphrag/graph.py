@@ -123,9 +123,31 @@ class KnowledgeGraph:
         key = key.lower()
         if not self.graph.has_node(key) or depth < 1:
             return set()
-        undirected = self.graph.to_undirected(as_view=True)
-        lengths = nx.single_source_shortest_path_length(undirected, key, cutoff=depth)
-        return {node for node in lengths if node != key}
+        return self.reachable([key], depth) - {key}
+
+    def reachable(self, keys: Iterable[str], depth: int = 1) -> Set[str]:
+        """Everything within ``depth`` hops of any of ``keys``, seeds included.
+
+        One breadth-first sweep from all seeds at once. Expanding each seed
+        separately re-walked the same neighbourhoods on every query, which on
+        a densely connected graph is the most expensive part of retrieval.
+        """
+        frontier = {
+            key.lower() for key in keys if self.graph.has_node(key.lower())
+        }
+        if not frontier or depth < 0:
+            return set()
+        visited = set(frontier)
+        for _ in range(depth):
+            nxt: Set[str] = set()
+            for node in frontier:
+                nxt.update(self.graph.successors(node))
+                nxt.update(self.graph.predecessors(node))
+            frontier = nxt - visited
+            if not frontier:
+                break
+            visited |= frontier
+        return visited
 
     def relationships(self) -> List[Dict[str, Any]]:
         return [
@@ -258,13 +280,7 @@ class KnowledgeGraph:
         if not entity_scores:
             return {}
 
-        reachable: Set[str] = set()
-        for seed in seeds:
-            seed = seed.lower()
-            if self.graph.has_node(seed):
-                reachable.add(seed)
-                reachable |= self.neighbors(seed, depth=depth)
-
+        reachable = self.reachable(seeds, depth=depth)
         chunk_scores: Dict[str, float] = {}
         for entity, score in entity_scores.items():
             if reachable and entity not in reachable:
