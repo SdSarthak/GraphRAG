@@ -13,7 +13,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
@@ -21,12 +21,18 @@ from .documents import Chunk
 from .embeddings import HashingEmbedder
 from .extraction import extract_query_entities
 from .graph import KnowledgeGraph
+from .storage import atomic_write_text
 from .text import content_tokens
 from .vectorstore import VectorStore
 
 
 class BM25Index:
-    """Okapi BM25 over pre-tokenised chunks."""
+    """Okapi BM25 over pre-tokenised chunks.
+
+    Supports incremental :meth:`add` (indexing a corpus document by document
+    is otherwise quadratic) and scores through an inverted index, so a query
+    only touches the chunks that actually contain one of its terms.
+    """
 
     def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
@@ -35,29 +41,65 @@ class BM25Index:
         self.doc_freqs: List[Counter] = []
         self.doc_lengths: List[int] = []
         self.avg_length: float = 0.0
-        self.inverse_doc_freq: Dict[str, float] = {}
+        self._positions: Dict[str, int] = {}
+        self._postings: Dict[str, Set[int]] = {}
 
     def __len__(self) -> int:
         return len(self.ids)
 
+    def __contains__(self, chunk_id: str) -> bool:
+        return chunk_id in self._positions
+
     def fit(self, ids: Sequence[str], documents: Sequence[Sequence[str]]) -> None:
-        """(Re)build the index from token lists."""
+        """(Re)build the index from token lists, discarding anything held."""
+        self.ids = []
+        self.doc_freqs = []
+        self.doc_lengths = []
+        self._positions = {}
+        self._postings = {}
+        self.add(ids, documents)
+
+    def add(self, ids: Sequence[str], documents: Sequence[Sequence[str]]) -> None:
+        """Add (or replace) documents without re-reading the whole corpus."""
         if len(ids) != len(documents):
             raise ValueError("ids and documents must have the same length")
-        self.ids = list(ids)
-        self.doc_freqs = [Counter(tokens) for tokens in documents]
-        self.doc_lengths = [len(tokens) for tokens in documents]
-        total = sum(self.doc_lengths)
-        self.avg_length = total / len(self.doc_lengths) if self.doc_lengths else 0.0
+        for chunk_id, tokens in zip(ids, documents):
+            freqs = Counter(tokens)
+            length = sum(freqs.values())
+            position = self._positions.get(chunk_id)
+            if position is None:
+                position = len(self.ids)
+                self._positions[chunk_id] = position
+                self.ids.append(chunk_id)
+                self.doc_freqs.append(freqs)
+                self.doc_lengths.append(length)
+            else:
+                for term in self.doc_freqs[position]:
+                    postings = self._postings.get(term)
+                    if postings is not None:
+                        postings.discard(position)
+                self.doc_freqs[position] = freqs
+                self.doc_lengths[position] = length
+            for term in freqs:
+                self._postings.setdefault(term, set()).add(position)
+        self.avg_length = (
+            sum(self.doc_lengths) / len(self.doc_lengths) if self.doc_lengths else 0.0
+        )
 
-        document_count = len(self.ids)
-        containing: Counter = Counter()
-        for freqs in self.doc_freqs:
-            containing.update(freqs.keys())
-        self.inverse_doc_freq = {
-            term: math.log(1.0 + (document_count - count + 0.5) / (count + 0.5))
-            for term, count in containing.items()
-        }
+    def idf(self, term: str) -> float:
+        """Inverse document frequency, computed on demand.
+
+        Kept lazy so that adding a document costs the length of that document
+        rather than the size of the whole vocabulary.
+        """
+        count = len(self._postings.get(term, ()))
+        if not count:
+            return 0.0
+        return math.log(1.0 + (len(self.ids) - count + 0.5) / (count + 0.5))
+
+    @property
+    def inverse_doc_freq(self) -> Dict[str, float]:
+        return {term: self.idf(term) for term in self._postings}
 
     def search(
         self, query_tokens: Sequence[str], top_k: int = 5
@@ -65,23 +107,33 @@ class BM25Index:
         """Return the ``top_k`` ``(chunk_id, bm25_score)`` pairs."""
         if not self.ids or not query_tokens or top_k <= 0:
             return []
-        scores: List[Tuple[str, float]] = []
-        for index, freqs in enumerate(self.doc_freqs):
-            length = self.doc_lengths[index] or 1
-            score = 0.0
-            for term in query_tokens:
-                frequency = freqs.get(term)
+
+        scores: Dict[int, float] = {}
+        average = self.avg_length or 1.0
+        for term in set(query_tokens):
+            candidates = self._postings.get(term)
+            if not candidates:
+                continue
+            idf = self.idf(term)
+            if idf <= 0.0:
+                continue
+            for index in candidates:
+                frequency = self.doc_freqs[index].get(term, 0)
                 if not frequency:
                     continue
-                idf = self.inverse_doc_freq.get(term, 0.0)
+                length = self.doc_lengths[index] or 1
                 denominator = frequency + self.k1 * (
-                    1.0 - self.b + self.b * length / (self.avg_length or 1.0)
+                    1.0 - self.b + self.b * length / average
                 )
-                score += idf * (frequency * (self.k1 + 1.0)) / denominator
-            if score > 0.0:
-                scores.append((self.ids[index], score))
-        scores.sort(key=lambda item: (-item[1], item[0]))
-        return scores[:top_k]
+                scores[index] = scores.get(index, 0.0) + idf * (
+                    frequency * (self.k1 + 1.0)
+                ) / denominator
+
+        ranked = sorted(
+            ((self.ids[index], score) for index, score in scores.items() if score > 0.0),
+            key=lambda item: (-item[1], item[0]),
+        )
+        return ranked[:top_k]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -94,22 +146,50 @@ class BM25Index:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BM25Index":
-        index = cls(k1=data.get("k1", 1.5), b=data.get("b", 0.75))
-        documents = [
-            [term for term, count in freqs.items() for _ in range(count)]
-            for freqs in data.get("doc_freqs", [])
-        ]
-        index.fit(data.get("ids", []), documents)
+        if not isinstance(data, dict):
+            raise ValueError("bm25 data must be a JSON object")
+        index = cls(k1=float(data.get("k1", 1.5)), b=float(data.get("b", 0.75)))
+        ids = list(data.get("ids", []))
+        doc_freqs = list(data.get("doc_freqs", []))
+        doc_lengths = list(data.get("doc_lengths", []))
+        if len(doc_freqs) != len(ids):
+            raise ValueError(
+                f"bm25 index is corrupt: {len(ids)} ids but "
+                f"{len(doc_freqs)} frequency tables"
+            )
+        if len(set(ids)) != len(ids):
+            raise ValueError("bm25 index is corrupt: duplicate chunk ids")
+
+        # Restoring used to rebuild a full token list per document just to
+        # re-count it, which meant holding the entire corpus in memory again.
+        for position, (chunk_id, freqs) in enumerate(zip(ids, doc_freqs)):
+            counter = Counter({str(term): int(count) for term, count in freqs.items()})
+            index._positions.setdefault(chunk_id, position)
+            index.ids.append(chunk_id)
+            index.doc_freqs.append(counter)
+            index.doc_lengths.append(
+                int(doc_lengths[position])
+                if position < len(doc_lengths)
+                else sum(counter.values())
+            )
+            for term in counter:
+                index._postings.setdefault(term, set()).add(position)
+        index.avg_length = (
+            sum(index.doc_lengths) / len(index.doc_lengths) if index.doc_lengths else 0.0
+        )
         return index
 
     def save(self, path: Union[str, Path]) -> None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict()), encoding="utf-8")
+        atomic_write_text(path, json.dumps(self.to_dict()))
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "BM25Index":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+        path = Path(path)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+        return cls.from_dict(payload)
 
 
 @dataclass

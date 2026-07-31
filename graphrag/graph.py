@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 import networkx as nx
 
 from .extraction import Entity, ExtractionResult, Relationship
+from .storage import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -299,36 +300,57 @@ class KnowledgeGraph:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "KnowledgeGraph":
+        if not isinstance(data, dict):
+            raise ValueError("graph data must be a JSON object")
         graph = cls()
         for node in data.get("nodes", []):
+            key = node.get("id")
+            if not key:
+                raise ValueError("graph node is missing its 'id'")
             chunks = set(node.get("chunks", []))
             graph.graph.add_node(
-                node["id"],
-                name=node.get("name", node["id"]),
+                key,
+                name=node.get("name", key),
                 type=node.get("type", "concept"),
                 mentions=node.get("mentions", 1),
                 chunks=chunks,
             )
             for chunk_id in chunks:
-                graph.chunk_entities.setdefault(chunk_id, set()).add(node["id"])
+                graph.chunk_entities.setdefault(chunk_id, set()).add(key)
+
+        dangling = 0
         for edge in data.get("edges", []):
+            source, target = edge.get("source"), edge.get("target")
+            # networkx creates missing endpoints on demand, which would inject
+            # attribute-less phantom entities that then get ranked and returned
+            # as if they were real. Drop those edges instead.
+            if not graph.graph.has_node(source) or not graph.graph.has_node(target):
+                dangling += 1
+                continue
             graph.graph.add_edge(
-                edge["source"],
-                edge["target"],
-                weight=edge.get("weight", 1.0),
-                types=edge.get("types", []),
+                source,
+                target,
+                weight=float(edge.get("weight", 1.0)),
+                types=list(edge.get("types", [])),
                 context=edge.get("context", ""),
+            )
+        if dangling:
+            logger.warning(
+                "Skipped %d relationship(s) pointing at unknown entities", dangling
             )
         return graph
 
     def save(self, path: Union[str, Path]) -> None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        atomic_write_text(path, json.dumps(self.to_dict(), indent=2))
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "KnowledgeGraph":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+        path = Path(path)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+        return cls.from_dict(payload)
 
     def export_graphml(self, path: Union[str, Path]) -> None:
         """Write a GraphML file for Gephi / Cytoscape."""

@@ -10,10 +10,11 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 from .config import GraphRAGConfig
 from .documents import Chunk, Document, chunk_document, coerce_documents, load_documents
 from .embeddings import HashingEmbedder, build_embedder
-from .extraction import build_extractor
+from .extraction import ExtractionResult, build_extractor
 from .graph import KnowledgeGraph
 from .llm import build_llm, generate_answer
 from .retrieval import BM25Index, HybridRetriever, RetrievedChunk, vectors_for_chunks
+from .storage import atomic_write_text
 from .text import content_tokens
 from .vectorstore import VectorStore
 
@@ -75,31 +76,50 @@ class GraphRAG:
     ) -> int:
         """Index documents. Returns the number of new chunks added."""
         docs = coerce_documents(documents, source=source)
+        new_documents: List[Document] = []
         new_chunks: List[Chunk] = []
+        seen: set = set()
         for document in docs:
-            if document.id in self.documents:
+            if document.id in self.documents or document.id in seen:
                 continue
-            self.documents[document.id] = document
+            seen.add(document.id)
+            new_documents.append(document)
             for chunk in chunk_document(
                 document, self.config.chunk_size, self.config.chunk_overlap
             ):
-                if chunk.id in self.chunks:
+                if chunk.id in self.chunks or chunk.id in seen:
                     continue
-                self.chunks[chunk.id] = chunk
+                seen.add(chunk.id)
                 new_chunks.append(chunk)
 
         if not new_chunks:
             logger.info("No new chunks to index")
             return 0
 
+        # Everything that can fail happens before any state is mutated. The
+        # previous order registered the chunks first, so a failure part way
+        # through left them recorded as indexed while carrying no vector, no
+        # entities and no keyword posting - and a retry skipped them as
+        # duplicates, making them permanently unretrievable.
         ids, matrix = vectors_for_chunks(new_chunks, self.embedder)
+        extractions = [
+            (chunk.id, self._extract(chunk)) for chunk in new_chunks
+        ]
+
         self.vector_store.add(ids, matrix)
-
+        for chunk_id, result in extractions:
+            self.graph.add_extraction(chunk_id, result)
+        for document in new_documents:
+            self.documents[document.id] = document
         for chunk in new_chunks:
-            result = self.extractor.extract(chunk.text)
-            self.graph.add_extraction(chunk.id, result)
+            self.chunks[chunk.id] = chunk
 
-        self._rebuild_bm25()
+        # Incremental: re-fitting the whole corpus on every call made indexing
+        # a corpus document by document quadratic in its size.
+        self.bm25.add(
+            [chunk.id for chunk in new_chunks],
+            [content_tokens(chunk.text) for chunk in new_chunks],
+        )
         logger.info(
             "Indexed %d chunks from %d documents (graph: %d entities, %d relations)",
             len(new_chunks),
@@ -120,12 +140,18 @@ class GraphRAG:
         self.add_documents(documents)
         return self.graph
 
-    def _rebuild_bm25(self) -> None:
-        ordered = list(self.chunks.values())
-        self.bm25.fit(
-            [chunk.id for chunk in ordered],
-            [content_tokens(chunk.text) for chunk in ordered],
-        )
+    def _extract(self, chunk: Chunk):
+        """Extract from one chunk, never letting it abort the whole batch."""
+        try:
+            return self.extractor.extract(chunk.text)
+        except Exception:  # noqa: BLE001 - one bad chunk must not lose the rest
+            logger.exception(
+                "Extraction failed for chunk %s (%s); indexing it without entities",
+                chunk.id,
+                chunk.source,
+            )
+            return ExtractionResult()
+
 
     # -- retrieval + generation -----------------------------------------
     @property
@@ -219,7 +245,8 @@ class GraphRAG:
         self.graph.save(target / GRAPH_FILE)
         self.vector_store.save(target / VECTORS_FILE)
         self.bm25.save(target / BM25_FILE)
-        (target / CHUNKS_FILE).write_text(
+        atomic_write_text(
+            target / CHUNKS_FILE,
             json.dumps(
                 {
                     "documents": [doc.to_dict() for doc in self.documents.values()],
@@ -227,10 +254,9 @@ class GraphRAG:
                 },
                 indent=2,
             ),
-            encoding="utf-8",
         )
-        (target / CONFIG_FILE).write_text(
-            json.dumps(self.config.to_dict(), indent=2), encoding="utf-8"
+        atomic_write_text(
+            target / CONFIG_FILE, json.dumps(self.config.to_dict(), indent=2)
         )
         logger.info("Saved index to %s", target)
         return target
@@ -246,14 +272,32 @@ class GraphRAG:
         source = Path(directory)
         if not source.exists():
             raise FileNotFoundError(f"No index directory at {source}")
+        if not source.is_dir():
+            raise NotADirectoryError(f"{source} is not an index directory")
+
+        # Report every missing part at once: chasing one FileNotFoundError per
+        # run to discover a half written index is nobody's idea of a good time.
+        missing = [
+            name
+            for name in (GRAPH_FILE, VECTORS_FILE, BM25_FILE, CHUNKS_FILE)
+            if not (source / name).is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"{source} is not a complete GraphRAG index; missing: "
+                + ", ".join(sorted(missing))
+            )
 
         if config is None:
             config_path = source / CONFIG_FILE
-            stored = (
-                json.loads(config_path.read_text(encoding="utf-8"))
-                if config_path.exists()
-                else {}
-            )
+            try:
+                stored = (
+                    json.loads(config_path.read_text(encoding="utf-8"))
+                    if config_path.exists()
+                    else {}
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{config_path} is not valid JSON: {exc}") from exc
             env_config = GraphRAGConfig.from_env()
             # A later save() with no argument must round-trip to where we
             # loaded from, not to whatever directory the index was built in.
@@ -266,13 +310,32 @@ class GraphRAG:
         system.vector_store = VectorStore.load(source / VECTORS_FILE)
         system.bm25 = BM25Index.load(source / BM25_FILE)
 
-        payload = json.loads((source / CHUNKS_FILE).read_text(encoding="utf-8"))
-        system.documents = {
-            data["id"]: Document.from_dict(data) for data in payload.get("documents", [])
-        }
-        system.chunks = {
-            data["id"]: Chunk.from_dict(data) for data in payload.get("chunks", [])
-        }
+        # An index built with a different embedding width only fails later, in
+        # the middle of a query, as an opaque numpy shape error.
+        embedder_dim = getattr(system.embedder, "dim", system.vector_store.dim)
+        if len(system.vector_store) and system.vector_store.dim != embedder_dim:
+            raise ValueError(
+                f"index at {source} holds {system.vector_store.dim}-dimensional "
+                f"vectors but the configured embedder produces "
+                f"{embedder_dim}; set GRAPHRAG_EMBEDDING_DIM="
+                f"{system.vector_store.dim} or re-index"
+            )
+
+        chunks_path = source / CHUNKS_FILE
+        try:
+            payload = json.loads(chunks_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{chunks_path} is not valid JSON: {exc}") from exc
+        try:
+            system.documents = {
+                data["id"]: Document.from_dict(data)
+                for data in payload.get("documents", [])
+            }
+            system.chunks = {
+                data["id"]: Chunk.from_dict(data) for data in payload.get("chunks", [])
+            }
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"{chunks_path} is missing required fields: {exc}") from exc
         logger.info(
             "Loaded index from %s (%d chunks, %d entities)",
             source,
