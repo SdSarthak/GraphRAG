@@ -4,12 +4,35 @@ The Claude backend is exercised with a stub client, so nothing here touches the
 network or needs an API key.
 """
 
+import logging
 import types
 
 import pytest
 
 from graphrag.config import GraphRAGConfig
-from graphrag.llm import AnthropicLLM, ExtractiveLLM, build_llm
+from graphrag.llm import (
+    AnthropicLLM,
+    ExtractiveLLM,
+    _split_prompt,
+    build_answer_prompt,
+    build_llm,
+    generate_answer,
+)
+
+
+class _StubStatusError(Exception):
+    def __init__(self, status_code, message):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+class _StubTimeout(Exception):
+    pass
+
+
+class _StubConnectionError(Exception):
+    pass
 
 
 def _block(kind: str, text: str = "") -> types.SimpleNamespace:
@@ -19,24 +42,29 @@ def _block(kind: str, text: str = "") -> types.SimpleNamespace:
 class _StubClient:
     """Stands in for ``anthropic.Anthropic``."""
 
-    def __init__(self, response):
+    def __init__(self, response, errors=()):
         self.response = response
+        self.errors = list(errors)
         self.calls = []
         self.messages = types.SimpleNamespace(create=self._create)
 
     def _create(self, **kwargs):
         self.calls.append(kwargs)
+        if self.errors:
+            raise self.errors.pop(0)
         return self.response
 
 
-def make_llm(response) -> AnthropicLLM:
+def make_llm(response, errors=()) -> AnthropicLLM:
     llm = AnthropicLLM.__new__(AnthropicLLM)  # skip SDK client construction
     llm.model = "claude-opus-5"
     llm.max_tokens = 1024
     llm.effort = "medium"
-    llm.client = _StubClient(response)
+    llm.client = _StubClient(response, errors)
     llm._anthropic = types.SimpleNamespace(
-        APIStatusError=RuntimeError, APIConnectionError=ConnectionError
+        APIStatusError=_StubStatusError,
+        APITimeoutError=_StubTimeout,
+        APIConnectionError=_StubConnectionError,
     )
     return llm
 
@@ -138,3 +166,93 @@ def test_extractive_llm_prefers_earlier_passages_on_ties():
 @pytest.mark.parametrize("question", ["", "   "])
 def test_extractive_llm_with_no_context(question):
     assert "enough information" in ExtractiveLLM().answer(question, "")
+
+
+# -- API failure modes --------------------------------------------------
+def test_api_status_errors_carry_an_actionable_message():
+    llm = make_llm(None, errors=[_StubStatusError(401, "invalid x-api-key")])
+    with pytest.raises(RuntimeError) as excinfo:
+        llm.complete(prompt="q")
+
+    message = str(excinfo.value)
+    assert "401" in message and "ANTHROPIC_API_KEY" in message
+
+
+def test_rate_limits_and_outages_say_what_to_do():
+    for status, expected in ((429, "Rate limited"), (529, "temporarily unavailable")):
+        llm = make_llm(None, errors=[_StubStatusError(status, "nope")])
+        with pytest.raises(RuntimeError) as excinfo:
+            llm.complete(prompt="q")
+        assert expected in str(excinfo.value)
+
+
+def test_timeouts_are_reported_as_timeouts():
+    llm = make_llm(None, errors=[_StubTimeout("took too long")])
+    with pytest.raises(RuntimeError) as excinfo:
+        llm.complete(prompt="q")
+    assert "timed out" in str(excinfo.value)
+
+
+def test_connection_errors_are_reported():
+    llm = make_llm(None, errors=[_StubConnectionError("dns failure")])
+    with pytest.raises(RuntimeError) as excinfo:
+        llm.complete(prompt="q")
+    assert "Could not reach" in str(excinfo.value)
+
+
+def test_an_old_sdk_without_output_config_is_retried_once():
+    response = types.SimpleNamespace(stop_reason="end_turn", content=[_block("text", "ok")])
+    llm = make_llm(
+        response,
+        errors=[TypeError("create() got an unexpected keyword argument 'output_config'")],
+    )
+    assert llm.complete(prompt="q") == "ok"
+    assert len(llm.client.calls) == 2
+    assert "output_config" not in llm.client.calls[1]
+
+
+def test_an_unrelated_typeerror_is_not_swallowed():
+    # Retrying a genuine bug just raises the same error one call later while
+    # hiding where it came from.
+    llm = make_llm(None, errors=[TypeError("unhashable type: 'dict'")])
+    with pytest.raises(TypeError):
+        llm.complete(prompt="q")
+    assert len(llm.client.calls) == 1
+
+
+def test_truncated_responses_are_flagged(caplog):
+    llm = make_llm(
+        types.SimpleNamespace(stop_reason="max_tokens", content=[_block("text", "half")])
+    )
+    with caplog.at_level(logging.WARNING):
+        assert llm.complete(prompt="q") == "half"
+    assert "truncated" in caplog.text
+
+
+# -- prompt round trip --------------------------------------------------
+def test_a_context_containing_the_word_question_does_not_hijack_the_query():
+    # A FAQ corpus is full of "Question:" lines; the offline answerer used to
+    # pick the first one it saw and answer that instead.
+    context = "[1] (source: faq.md)\nQuestion: what is a transformer? It is a model."
+    prompt = build_answer_prompt("What is deep learning?", context)
+    question, recovered = _split_prompt(prompt)
+
+    assert question == "What is deep learning?"
+    assert recovered == context
+
+
+def test_extractive_backend_answers_the_real_question_through_complete():
+    context = (
+        "[1] (source: faq.md)\nQuestion: what is a transformer?\n\n"
+        "[2] (source: notes.md)\nDeep learning uses neural networks."
+    )
+    answer = generate_answer(ExtractiveLLM(), "What does deep learning use?", context)
+    assert "neural networks" in answer
+
+
+def test_source_paths_containing_brackets_are_not_treated_as_content():
+    context = "[1] (source: C:\\notes (copy)\\a.txt)\nDeep learning uses neural networks."
+    answer = ExtractiveLLM().answer("What does deep learning use?", context)
+
+    assert "neural networks" in answer
+    assert "a.txt" not in answer

@@ -75,7 +75,13 @@ class ExtractiveLLM:
                 current_rank = int(marker.group(1))
                 current_citation = f"[{current_rank}]"
                 line = line[marker.end() :].strip()
-                line = re.sub(r"^\(source:[^)]*\)", "", line).strip()
+                # Prefer the whole-line form: a Windows path such as
+                # "C:\notes (copy)\a.txt" contains a closing bracket, and the
+                # non-greedy form left "\a.txt)" behind as a fake sentence.
+                stripped = re.sub(r"^\(source:.*\)\s*$", "", line)
+                if stripped == line:
+                    stripped = re.sub(r"^\(source:[^)]*\)", "", line)
+                line = stripped.strip()
             if not line:
                 continue
             for sentence in split_sentences(line):
@@ -123,6 +129,9 @@ class AnthropicLLM:
         api_key: Optional[str] = None,
         max_tokens: int = 8192,
         effort: str = "medium",
+        timeout: float = 120.0,
+        max_retries: int = 2,
+        client: Any = None,
     ) -> None:
         try:
             import anthropic
@@ -136,9 +145,15 @@ class AnthropicLLM:
         self.max_tokens = max_tokens
         self.effort = effort
         self._anthropic = anthropic
-        # The SDK resolves ANTHROPIC_API_KEY (or an `ant auth login` profile)
-        # on its own when api_key is None.
-        self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+        # An explicit timeout and retry budget: the SDK default lets a stalled
+        # request hang for ten minutes, which for an unattended CLI run or a
+        # batch index over thousands of chunks is indistinguishable from a
+        # hang. Transient 429/5xx responses are retried by the SDK itself.
+        self.client = client or anthropic.Anthropic(
+            **({"api_key": api_key} if api_key else {}),
+            timeout=timeout,
+            max_retries=max_retries,
+        )
 
     @property
     def name(self) -> str:
@@ -204,15 +219,39 @@ class AnthropicLLM:
             kwargs["system"] = system
 
         try:
-            return self.client.messages.create(**kwargs)
-        except TypeError:
+            return self._send(kwargs)
+        except TypeError as exc:
             # Older SDK builds do not accept output_config; retry without it so
             # generation still works (structured output degrades to free text).
+            # Any *other* TypeError is a real bug and must not be swallowed by
+            # a blind retry that would just raise the same thing again.
+            if "output_config" not in str(exc) or "output_config" not in kwargs:
+                raise
+            logger.info(
+                "Installed anthropic SDK predates output_config; "
+                "retrying without it (upgrade with: pip install -U anthropic)"
+            )
             kwargs.pop("output_config", None)
+            return self._send(kwargs)
+
+    def _send(self, kwargs: Dict[str, Any]) -> Any:
+        try:
             return self.client.messages.create(**kwargs)
         except self._anthropic.APIStatusError as exc:
+            status = getattr(exc, "status_code", "unknown")
+            message = getattr(exc, "message", None) or str(exc)
+            hint = ""
+            if status == 401:
+                hint = " Check ANTHROPIC_API_KEY."
+            elif status == 429:
+                hint = " Rate limited; retry later or lower the request rate."
+            elif status in (500, 502, 503, 529):
+                hint = " The API is temporarily unavailable; retry later."
+            raise RuntimeError(f"Claude API error ({status}): {message}.{hint}") from exc
+        except self._anthropic.APITimeoutError as exc:
             raise RuntimeError(
-                f"Claude API error ({exc.status_code}): {exc.message}"
+                f"Claude API request timed out: {exc}. Raise GRAPHRAG_LLM_TIMEOUT "
+                "or reduce GRAPHRAG_LLM_MAX_TOKENS."
             ) from exc
         except self._anthropic.APIConnectionError as exc:
             raise RuntimeError(f"Could not reach the Claude API: {exc}") from exc
@@ -220,9 +259,17 @@ class AnthropicLLM:
     @staticmethod
     def _text_of(response: Any) -> str:
         # Safety classifiers can decline: check stop_reason before content.
-        if getattr(response, "stop_reason", None) == "refusal":
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "refusal":
             logger.warning("Claude declined to answer this request")
             return ""
+        if stop_reason == "max_tokens":
+            # Silently returning a truncated answer looks like a complete one,
+            # and truncated JSON fails to parse for no visible reason.
+            logger.warning(
+                "Claude hit the max_tokens limit; the response is truncated. "
+                "Raise GRAPHRAG_LLM_MAX_TOKENS."
+            )
         parts = [
             block.text
             for block in getattr(response, "content", [])
@@ -234,10 +281,16 @@ class AnthropicLLM:
 def _split_prompt(prompt: str) -> tuple:
     """Recover ``(question, context)`` from a rendered answer prompt."""
     context = ""
+    tail = prompt
     match = re.search(r"<context>\n(.*?)\n</context>", prompt, re.DOTALL)
     if match:
         context = match.group(1)
-    question_match = re.search(r"Question:\s*(.+)", prompt)
+        # Only look for the question *after* the context block. Searching the
+        # whole prompt meant a corpus that itself contained the word
+        # "Question:" hijacked the question, and the offline answerer went on
+        # to answer something the user never asked.
+        tail = prompt[match.end() :]
+    question_match = re.search(r"Question:\s*(.+)", tail)
     question = question_match.group(1).strip() if question_match else prompt
     return question, context
 
@@ -262,6 +315,8 @@ def build_llm(config, allow_remote: bool = True) -> Any:
             api_key=config.api_key,
             max_tokens=config.llm_max_tokens,
             effort=config.llm_effort,
+            timeout=getattr(config, "llm_timeout", 120.0),
+            max_retries=getattr(config, "llm_max_retries", 2),
         )
     except RuntimeError as exc:
         logger.warning("%s Falling back to the extractive answerer.", exc)

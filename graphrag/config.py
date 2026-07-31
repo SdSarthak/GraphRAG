@@ -30,6 +30,8 @@ class GraphRAGConfig:
     llm_model: str = "claude-opus-5"
     llm_max_tokens: int = 8192
     llm_effort: str = "medium"  # low | medium | high | xhigh | max
+    llm_timeout: float = 120.0  # seconds before a request is abandoned
+    llm_max_retries: int = 2  # transient 429/5xx retries inside the SDK
     api_key: Optional[str] = None
 
     # --- Indexing -------------------------------------------------------
@@ -78,6 +80,10 @@ class GraphRAGConfig:
                      "max_context_chars"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.llm_timeout <= 0.0:
+            raise ValueError("llm_timeout must be positive")
+        if self.llm_max_retries < 0:
+            raise ValueError("llm_max_retries must not be negative")
         if self.min_entity_length < 1:
             raise ValueError("min_entity_length must be at least 1")
         if self.rrf_k < 1:
