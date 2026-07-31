@@ -90,8 +90,36 @@ RELATION_VERBS = {
     "relates": "related_to",
 }
 
-_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'\-]*", re.IGNORECASE)
-_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
+# Scripts written without spaces between words. A word-boundary tokeniser
+# would collapse a whole Chinese or Japanese sentence into one useless token,
+# so these are tokenised one character at a time instead (cheap unigram
+# segmentation - crude, but it produces real, matchable terms where a
+# whitespace tokeniser produces none).
+_CJK_RANGES = (
+    "぀-ヿ"  # hiragana + katakana
+    "㐀-䶿"  # CJK extension A
+    "一-鿿"  # CJK unified ideographs
+    "豈-﫿"  # CJK compatibility ideographs
+)
+
+# ``[^\W_]`` is "letter or digit in any script" - unlike ``[a-zA-Z0-9]`` it
+# keeps accented Latin, Cyrillic, Greek, Hangul and so on. Without this the
+# whole pipeline silently discards non-ASCII corpora: "café" became "caf" and
+# Cyrillic text tokenised to nothing at all, leaving zero embeddings and an
+# empty keyword index.
+_LETTER = f"[^\\W_{_CJK_RANGES}]"
+_TOKEN_RE = re.compile(f"[{_CJK_RANGES}]|{_LETTER}+(?:['’\\-]{_LETTER}+)*")
+_CJK_RE = re.compile(f"[{_CJK_RANGES}]")
+
+# Romance-language elision: "l'apprentissage" is the article plus the noun and
+# must split, while the English contraction "don't" must not. The two are told
+# apart by which side is short - elisions have a one or two letter *prefix*,
+# contractions a short suffix.
+_ELISION_RE = re.compile(f"^({_LETTER}{{1,2}})['’]({_LETTER}.*)$")
+# ASCII terminators need trailing whitespace so "3.14" and "U.S.A." stay
+# intact; the CJK terminators are unambiguous and are usually not followed by
+# a space at all.
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*|\n{2,}")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -101,16 +129,37 @@ def normalize(text: str) -> str:
 
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase word tokens, punctuation removed."""
-    return [match.group(0).lower() for match in _TOKEN_RE.finditer(text)]
+    """Lowercase word tokens, punctuation removed.
+
+    Unicode aware: accented and non-Latin scripts survive tokenisation, and
+    CJK text is segmented into single characters.
+    """
+    tokens: List[str] = []
+    for match in _TOKEN_RE.finditer(text):
+        token = match.group(0).lower()
+        elision = _ELISION_RE.match(token)
+        if elision:
+            tokens.append(elision.group(1))
+            token = elision.group(2)
+        tokens.append(token)
+    return tokens
+
+
+def is_cjk(token: str) -> bool:
+    """True when the token comes from a script that has no word spacing."""
+    return bool(_CJK_RE.search(token))
 
 
 def content_tokens(text: str, min_length: int = 3) -> List[str]:
-    """Tokens with stopwords and very short tokens removed."""
+    """Tokens with stopwords and very short tokens removed.
+
+    The length floor is skipped for CJK tokens: single characters are the
+    whole unit of meaning there, so applying it would discard every term.
+    """
     return [
         token
         for token in tokenize(text)
-        if token not in STOPWORDS and len(token) >= min_length
+        if token not in STOPWORDS and (len(token) >= min_length or is_cjk(token))
     ]
 
 

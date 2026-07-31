@@ -31,10 +31,15 @@ from .text import (
 
 logger = logging.getLogger(__name__)
 
-# "Deep Learning", "United States of America", "NASA"
-_PROPER_NOUN_RE = re.compile(
-    r"\b[A-Z][a-zA-Z0-9]*(?:[ -](?:of|de|and|the|for)?[ ]?[A-Z][a-zA-Z0-9]*)*\b"
-)
+# Individual words, in any script. Proper-noun phrases are assembled from
+# these in Python rather than by a regex, because "is this word capitalised"
+# cannot be expressed in a unicode-aware way in the ``re`` module: a
+# ``[A-Z]``-based pattern silently fails on "Émile Borel" or "Ürümqi".
+_WORD_RE = re.compile(r"[^\W_]+(?:['’\-][^\W_]+)*")
+
+# Lowercase words allowed *inside* a proper-noun phrase:
+# "United States of America", "Bank of England".
+_PHRASE_CONNECTORS = frozenset({"of", "de", "and", "the", "for", "von", "van", "la"})
 
 
 @dataclass
@@ -157,12 +162,9 @@ class RuleBasedExtractor:
     def _proper_nouns(self, text: str) -> Dict[str, int]:
         found: Counter = Counter()
         for sentence in split_sentences(text):
-            words = sentence.split()
-            first_word = words[0] if words else ""
-            for match in _PROPER_NOUN_RE.finditer(sentence):
-                candidate = match.group(0).strip()
+            for start, candidate in self._proper_noun_spans(sentence):
                 # A capitalised first word is not evidence of a proper noun.
-                if match.start() == 0 and candidate == first_word.strip(".,;:"):
+                if start == 0 and " " not in candidate:
                     continue
                 if len(candidate) < self.min_entity_length:
                     continue
@@ -170,6 +172,49 @@ class RuleBasedExtractor:
                     continue
                 found[candidate] += 1
         return dict(found)
+
+    @staticmethod
+    def _proper_noun_spans(sentence: str) -> List[Tuple[int, str]]:
+        """Maximal runs of capitalised words, e.g. "United States of America".
+
+        Words are joined only when nothing but a single space or hyphen
+        separates them, so punctuation ends a phrase.
+        """
+        spans: List[Tuple[int, str]] = []
+        current: List[str] = []
+        start = -1
+        previous_end = -1
+
+        def flush() -> None:
+            nonlocal current, start
+            while current and current[-1].lower() in _PHRASE_CONNECTORS:
+                current.pop()  # never end a phrase on "of"/"the"
+            if current:
+                spans.append((start, " ".join(current)))
+            current = []
+            start = -1
+
+        for match in _WORD_RE.finditer(sentence):
+            word = match.group(0)
+            gap = sentence[previous_end : match.start()] if current else ""
+            contiguous = bool(current) and gap in (" ", "-", " - ")
+            is_capitalised = word[:1].isupper()
+            is_connector = word.lower() in _PHRASE_CONNECTORS
+
+            if is_capitalised and contiguous:
+                current.append(word)
+            elif is_capitalised:
+                flush()
+                current = [word]
+                start = match.start()
+            elif is_connector and contiguous:
+                current.append(word)
+            else:
+                flush()
+            previous_end = match.end()
+
+        flush()
+        return spans
 
     def _key_phrases(self, text: str) -> Dict[str, int]:
         phrases: Counter = Counter()
