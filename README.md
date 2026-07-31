@@ -174,6 +174,18 @@ rag = GraphRAG(config=config)
 
 See `.env.example` for every supported variable.
 
+Values are resolved lowest priority first: dataclass defaults, the config
+stored inside an existing index, `GRAPHRAG_*` environment variables, then
+explicit CLI flags or keyword arguments. That means `graphrag query` reuses
+the chunking and embedding settings the index was actually built with, and
+does not need the original environment to be recreated.
+
+Text handling is unicode aware: accented Latin, Cyrillic, Greek and Hangul
+tokenise normally, CJK is segmented per character, and Romance-language
+elisions (`l'apprentissage`) split while English contractions (`don't`) do
+not. The stopword list and relation-verb lexicon are English only, so entity
+quality is best on English corpora even though retrieval works on any of them.
+
 ---
 
 ## Project layout
@@ -190,6 +202,7 @@ graphrag/
   retrieval.py    BM25, reciprocal rank fusion, HybridRetriever
   llm.py          AnthropicLLM (Claude) and ExtractiveLLM (offline)
   pipeline.py     GraphRAG: indexing, querying, save/load
+  storage.py      Crash-safe (write-then-rename) file writes
   cli.py          Command line interface
 tests/            pytest suite
 main.py           Demo entrypoint
